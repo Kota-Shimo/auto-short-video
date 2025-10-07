@@ -5,7 +5,7 @@ on:
   schedule:
     #- cron: '0 0  * * *'    # UTC00:00 → JST09:00
     #- cron: '0 6  * * *'    # UTC06:00 → JST15:00
-    - cron: '0 12 * * *'    # UTC12:00 → JST21:00
+    #- cron: '0 12 * * *'    # UTC12:00 → JST21:00
   workflow_dispatch:        # 手動トリガー
 
 concurrency:
