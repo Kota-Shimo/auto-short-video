@@ -19,18 +19,45 @@ FONT_LATN  = FONT_DIR / "RobotoSerif_36pt-Bold.ttf"
 FONT_CJK   = FONT_DIR / "NotoSansJP-Bold.ttf"
 FONT_KO    = FONT_DIR / "malgunbd.ttf"
 
+# フォント存在チェック（落とさず警告だけ）
 for fp in (FONT_LATN, FONT_CJK, FONT_KO):
-    if not fp.exists():
-        raise FileNotFoundError(f"Font missing: {fp}")
+    try:
+        if not fp.exists():
+            logging.warning(f"[font] Missing: {fp}")
+    except Exception:
+        logging.exception("[font] exists check failed")
 
-def pick_font(text: str) -> str:
-    for ch in text:
+def pick_font(text: str) -> str | None:
+    """文字種に応じてフォントパスを返す。無ければ None（後段で fallback）。"""
+    try:
+        has_latn = FONT_LATN.exists()
+        has_cjk  = FONT_CJK.exists()
+        has_ko   = FONT_KO.exists()
+    except Exception:
+        has_latn = has_cjk = has_ko = False
+
+    for ch in text or "":
         cp = ord(ch)
-        if 0xAC00 <= cp <= 0xD7A3:        # Hangul
+        if 0xAC00 <= cp <= 0xD7A3 and has_ko:             # Hangul
             return str(FONT_KO)
-        if (0x4E00 <= cp <= 0x9FFF) or (0x3040 <= cp <= 0x30FF):
-            return str(FONT_CJK)          # CJK/Kana
-    return str(FONT_LATN)
+        if ((0x4E00 <= cp <= 0x9FFF) or (0x3040 <= cp <= 0x30FF)) and has_cjk:
+            return str(FONT_CJK)                           # CJK/Kana
+    if has_latn:
+        return str(FONT_LATN)
+    if has_cjk:
+        return str(FONT_CJK)
+    if has_ko:
+        return str(FONT_KO)
+    return None
+
+def _load_font(font_path: str | None, size: int) -> ImageFont.FreeTypeFont:
+    """指定フォントが無くても落ちない安全ロード"""
+    try:
+        if font_path:
+            return ImageFont.truetype(font_path, size)
+    except Exception:
+        logging.exception("[font] truetype failed")
+    return ImageFont.load_default()
 
 # ------------ Language name map (ISO639-1 -> English name) ----
 LANG_NAME = {
@@ -56,7 +83,8 @@ BADGE_BASE   = "Lesson"
 BADGE_SIZE   = 60
 BADGE_POS    = (40, 30)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# OpenAI クライアント（キー未設定でも落ちない）
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ------------------------------------------------------ Unsplash BG
 def _unsplash(topic: str) -> Image.Image:
@@ -101,20 +129,37 @@ def _caption(topic: str, lang_code: str) -> str:
         "Hotel|Check-in made easy"
     ).replace("{lang}", lang_name)
 
-    txt = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.6
-    ).choices[0].message.content.strip()
+    txt = ""
+    if client:
+        try:
+            txt = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.6
+            ).choices[0].message.content.strip()
+        except Exception:
+            logging.exception("[OpenAI caption]")
 
-    # フォーマット崩れの保険：パイプが無ければ適当に分割
+    # フォールバック（OpenAI失敗や空文字対策）
+    if not txt:
+        defaults = {
+            "ja": "ホテル|チェックインを頼む",
+            "en": "Hotel|Check-in made easy",
+            "ko": "호텔|체크인 쉽게",
+            "es": "Hotel|Check-in fácil",
+        }
+        txt = defaults.get(lang_code, "Hotel|Check-in made easy")
+
+    # フォーマット崩れの保険：パイプが無ければ擬似分割し、常に2行にする
     parts = [p.strip() for p in txt.split("|") if p.strip()]
-    if len(parts) == 1:
-        # 1行しか来なければ「シーン|フレーズ」に擬似分割
+    if len(parts) == 0:
+        parts = ["Everyday", "Speak now"]
+    elif len(parts) == 1:
         seg = parts[0]
         mid = max(1, min(len(seg) // 2, 16))
-        parts = [seg[:mid].strip(), seg[mid:].strip()]
-    return f"{parts[0][:22]}|{parts[1][:24]}"  # 最終ガード
+        parts = [seg[:mid].strip() or "Everyday", seg[mid:].strip() or "Speak now"]
+
+    return f"{(parts[0] or 'Everyday')[:22]}|{(parts[1] or 'Speak now')[:24]}"  # 最終ガード
 
 # ------------------------------------------------------ helpers
 def _txt_size(draw: ImageDraw.ImageDraw, txt: str, font: ImageFont.FreeTypeFont):
@@ -132,14 +177,15 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
     l1, l2  = (cap.split("|") + [""])[:2]
     l1, l2  = l1.strip(), l2.strip()
 
-    f1 = ImageFont.truetype(pick_font(l1),          F_H1)
-    f2 = ImageFont.truetype(pick_font(l2 or l1),    F_H2)
+    # フォント読み込みを安全化（無くても落とさない）
+    f1 = _load_font(pick_font(l1),          F_H1)
+    f2 = _load_font(pick_font(l2 or l1),    F_H2)
 
-    t1 = textwrap.fill(l1, WRAP_H1)
+    t1 = textwrap.fill(l1, WRAP_H1) if l1 else ""
     t2 = textwrap.fill(l2, WRAP_H2) if l2 else ""
 
-    w1, h1 = _txt_size(draw, t1, f1)
-    w2, h2 = (_txt_size(draw, t2, f2) if t2 else (0, 0))
+    w1, h1 = _txt_size(draw, t1, f1) if t1 else (0, 0)
+    w2, h2 = _txt_size(draw, t2, f2) if t2 else (0, 0)
 
     stroke = 4
     tw = max(w1, w2) + stroke*2
@@ -155,7 +201,7 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
     x_txt   = x_panel + pad_x
     y_txt   = y_panel + pad_y
 
-    # glass panel
+    # glass panel（元のまま）
     radius = 35
     panel_bg = img.crop((x_panel, y_panel, x_panel+pw, y_panel+ph)) \
                   .filter(ImageFilter.GaussianBlur(12)).convert("RGBA")
@@ -172,25 +218,27 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
     panel = Image.alpha_composite(panel, border)
     img.paste(panel, (x_panel, y_panel), panel)
 
-    # glow
+    # glow（元のまま）
     glow = Image.new("RGBA", img.size, (0,0,0,0))
     gd   = ImageDraw.Draw(glow)
-    gd.text((x_txt, y_txt), t1, font=f1, fill=(255,255,255,255))
+    if t1:
+        gd.text((x_txt, y_txt), t1, font=f1, fill=(255,255,255,255))
     if t2:
         gd.text((x_txt, y_txt+h1+12), t2, font=f2, fill=(255,255,255,255))
     glow = glow.filter(ImageFilter.GaussianBlur(14))
     glow = ImageEnhance.Brightness(glow).enhance(1.2)
     img.alpha_composite(glow)
 
-    # final text
-    draw.text((x_txt, y_txt), t1, font=f1, fill=(255,255,255),
-              stroke_width=stroke, stroke_fill=(0,0,0))
+    # final text（元のまま）
+    if t1:
+        draw.text((x_txt, y_txt), t1, font=f1, fill=(255,255,255),
+                  stroke_width=stroke, stroke_fill=(0,0,0))
     if t2:
         draw.text((x_txt, y_txt+h1+12), t2, font=f2,
                   fill=(255,255,255), stroke_width=stroke, stroke_fill=(0,0,0))
 
-    # badge
-    bf  = ImageFont.truetype(pick_font(badge_txt), BADGE_SIZE)
+    # badge（フォント未配置でも落ちない）
+    bf  = _load_font(pick_font(badge_txt), BADGE_SIZE)
     draw.text(BADGE_POS, badge_txt, font=bf,
               fill=(255,255,255), stroke_width=3, stroke_fill=(0,0,0))
     return img
@@ -198,12 +246,16 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
 # ------------------------------------------------------ public
 def make_thumbnail(topic: str, lang_code: str, out: Path):
     """
-    lang_code は main.py から渡される第二字幕言語（subs[1]）を想定。
+    lang_code は main.py から渡される第二字幕言語（subs[1）を想定。
     ここでは言語名に変換して GPT に明示するため、LANG_NAME を用いる。
     """
     bg    = _unsplash(topic)
     cap   = _caption(topic, lang_code)  # ← 安定して指定言語になる
-    badge = translate(BADGE_BASE, lang_code) or BADGE_BASE
+    try:
+        badge = translate(BADGE_BASE, lang_code) or BADGE_BASE
+    except Exception:
+        logging.exception("[translate]")
+        badge = BADGE_BASE
     thumb = _draw(bg, cap, badge)
     thumb.convert("RGB").save(out, "JPEG", quality=92)
     logging.info("🖼️  Thumbnail saved → %s", out.name)
